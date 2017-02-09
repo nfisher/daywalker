@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -67,7 +68,7 @@ func (r *Repository) RetrieveJar(coord string) error {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("want %v == 200, got %v\n", coord, resp.Status)
+		return errors.New(fmt.Sprintf("want %v == 200, got %v", coord, resp.Status))
 	}
 
 	jf := fmt.Sprintf("%v-%v.jar", d.ArtifactId, d.Version)
