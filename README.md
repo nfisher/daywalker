@@ -2,7 +2,7 @@
 
 # daywalker
 
-Download transitive dependencies for maven co-ordinate.
+Download transitive dependencies for maven co-ordinate into the current folder. Good for downloading dependencies when using build tools like "buck":https://buckbuild.com/.
 
 ## Maven Coordinates
 
@@ -27,3 +27,4 @@ daywalker com.sparkjava:spark-core:2.5.4
 - alternative repo locations.
 - download to specified folder.
 - download of test dependencies in test folder or equivalent.
+- generate buck entry.
