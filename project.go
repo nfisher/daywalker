@@ -5,6 +5,7 @@ import (
 	"encoding/gob"
 	"encoding/xml"
 	"fmt"
+	"strings"
 )
 
 type Dependency struct {
@@ -18,24 +19,57 @@ func (d *Dependency) Coord() string {
 	return d.GroupId + ":" + d.ArtifactId + ":" + d.Version
 }
 
+const Unresolved = "unresolved_"
+const Managed = "managed_"
+
+func ManagedRelationship(dep *Dependency) string {
+	scope := dep.Scope
+	if scope == "" {
+		scope = "compile"
+	}
+
+	return Managed + scope
+}
+
+func Relationship(dep *Dependency) string {
+	scope := dep.Scope
+	if scope == "" {
+		scope = "compile"
+	}
+
+	if dep.Version == "" {
+		return Unresolved + scope
+	}
+
+	if strings.Contains(dep.Coord(), "$") {
+		return Unresolved + scope
+	}
+
+	return scope
+}
+
 type Property struct {
 	XMLName xml.Name `xml:""`
-	Value   string   `xml:",chardata"`
+	Data    string   `xml:",chardata"`
 }
 
 func (p *Property) Name() string {
 	return p.XMLName.Local
 }
 
-type Properties struct {
+func (p *Property) Value() string {
+	return p.Data
+}
+
+type PropertyList struct {
 	List []Property `xml:",any"`
 }
 
 type Project struct {
-	Parent               *Dependency  `xml:"parent,omitempty"`
-	Properties           Properties   `xml:"properties,omitempty"`
-	Dependencies         []Dependency `xml:"dependencies>dependency"`
-	DependencyManagement []Dependency `xml:"dependencyManagement>dependencies>dependency"`
+	Parent               *Dependency   `xml:"parent,omitempty"`
+	PropertyList         PropertyList  `xml:"properties,omitempty"`
+	Dependencies         []*Dependency `xml:"dependencies>dependency"`
+	DependencyManagement []*Dependency `xml:"dependencyManagement>dependencies>dependency"`
 }
 
 func (p *Project) deepCopy() (*Project, error) {
@@ -58,23 +92,27 @@ func (p *Project) deepCopy() (*Project, error) {
 	return c, nil
 }
 
+func (p *Project) Properties() []Property {
+	return p.PropertyList.List
+}
+
 func (p *Project) MergeProperties(seen Set) (*Project, error) {
 	lookups := make(map[string]string)
-	list := p.Properties.List
+	list := p.Properties()
 	parent := p.Parent
 
 	if parent != nil {
 		lookups["${project.version}"] = parent.Version
 	}
 
-	deps := make([]Dependency, 0, 1024)
-	depManagement := make([]Dependency, 0, 1024)
-	coords := make(map[string]Dependency)
+	deps := make([]*Dependency, 0, 1024)
+	depManagement := make([]*Dependency, 0, 1024)
+	coords := make(map[string]*Dependency)
 
 	for parent != nil {
 		parentPom := seen[parent.Coord()]
 		fmt.Printf(" RAWWWRR %v\n", parent.Coord())
-		list = append(list, parentPom.Properties.List...)
+		list = append(list, parentPom.Properties()...)
 		deps = append(deps, parentPom.Dependencies...)
 		depManagement = append(depManagement, parentPom.DependencyManagement...)
 		parent = parentPom.Parent
@@ -87,7 +125,7 @@ func (p *Project) MergeProperties(seen Set) (*Project, error) {
 	}
 
 	for _, props := range list {
-		lookups["${"+props.Name()+"}"] = props.Value
+		lookups["${"+props.Name()+"}"] = props.Value()
 	}
 
 	c, err := p.deepCopy()

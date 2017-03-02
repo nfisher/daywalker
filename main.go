@@ -3,9 +3,11 @@ package main
 import (
 	"flag"
 	"fmt"
-	"os"
-	"path/filepath"
+	"log"
 	"strings"
+	"sync"
+
+	"github.com/nfisher/daywalker/graph"
 )
 
 type Set map[string]*Project
@@ -16,10 +18,15 @@ func (s Set) Contains(coord string) bool {
 }
 
 func main() {
+	var coord string
+	var useGraph bool
+
+	flag.StringVar(&coord, "coord", "", "starting project coordinate [required]. (e.g. com.sparkjava:spark-core:2.5.4)")
+	flag.BoolVar(&useGraph, "graph", false, "use digraph to map dependencies [in progress].")
 	flag.Parse()
 
-	if len(flag.Args()) != 1 {
-		fmt.Println("need a starting coordinate (e.g. com.sparkjava:spark-core:2.5.4)")
+	if coord == "" {
+		flag.Usage()
 		return
 	}
 
@@ -27,77 +34,138 @@ func main() {
 		Base: "https://search.maven.org/remotecontent?filepath=",
 	}
 
-	coord := flag.Args()[0]
+	if useGraph {
+		var wg sync.WaitGroup
 
-	seen := make(Set)
-	FollowGraph(r, coord, seen)
+		ch := make(chan string, 32)
+		g := graph.New()
 
-	bf, err := os.Create("BUCK." + coord)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	defer bf.Close()
-
-	deps := make([]string, 0, len(seen))
-
-	for k := range seen {
-		err := r.RetrieveJar(k)
-		if err != nil {
-			fmt.Println(err)
-			continue
+		for i := 0; i < 16; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				for coord := range ch {
+					fmt.Printf("[%v] start processing pom %v\n", i, coord)
+					walkPoms(coord, r, g, ch)
+					fmt.Printf("[%v] done processing pom %v \n", i, coord)
+				}
+			}(i)
 		}
 
-		if k != coord {
-			d := split(k)
-			f := filepath.Base(filename(d, "jar"))
-			line := fmt.Sprintf("prebuilt_jar(name='%v', binary_jar='%v', visibility=['PUBLIC'])\n\n", d.ArtifactId, f)
-			deps = append(deps, d.ArtifactId)
-			bf.Write([]byte(line))
-		}
-	}
+		ch <- coord
 
-	d := split(coord)
-	f := filepath.Base(filename(d, "jar"))
-	line := fmt.Sprintf("prebuilt_jar(name='%v', binary_jar='%v', visibility=['PUBLIC'], deps=[\n':%v'\n] )\n\n", d.ArtifactId, f, strings.Join(deps, "',\n':"))
-	bf.Write([]byte(line))
+		wg.Wait()
+		close(ch)
+
+		graph.Print(g)
+	} else {
+		oldMain(coord, r)
+	}
 }
 
-func FollowGraph(r *Repository, coord string, seen Set) {
-	if seen.Contains(coord) {
+func processProperties(coord string, g *graph.Digraph, pom *Project) {
+	for _, prop := range pom.Properties() {
+		to := graph.NewNode("${" + prop.Name() + "}")
+		to.Value = prop.Value()
+
+		g.EdgeTo(coord, to, "property")
+	}
+}
+
+func processParent(coord string, g *graph.Digraph, pom *Project, ch chan string) {
+	if pom.Parent != nil {
+		prop := graph.NewNode("${project.version}")
+		prop.Value = pom.Parent.Version
+
+		parentCoord := pom.Parent.Coord()
+
+		g.Edge(coord, parentCoord, "parent")
+		g.Edge(parentCoord, coord, "child")
+		g.EdgeTo(coord, prop, "property")
+
+		ch <- parentCoord
+	}
+}
+
+func processManagedDependencies(coord string, g *graph.Digraph, pom *Project) {
+	for _, dm := range pom.DependencyManagement {
+		depCoord := dm.Coord()
+
+		rel := ManagedRelationship(dm)
+
+		g.Edge(coord, depCoord, rel)
+	}
+}
+
+func processDependencies(coord string, g *graph.Digraph, pom *Project) {
+	for _, dep := range pom.Dependencies {
+		depCoord := dep.Coord()
+
+		if strings.Contains(depCoord, "$") {
+			properties := g.Children(coord, graph.HasRelationship("property"))
+			for _, p := range properties {
+				if strings.Contains(depCoord, p.Name()) {
+					v, ok := p.Value.(string)
+					if !ok {
+						fmt.Printf("property %#v has unexpected value %#v\n", p.Name(), p.Value)
+					}
+					depCoord = strings.Replace(depCoord, p.Name(), v, -1)
+					dep = split(depCoord)
+				}
+			}
+		}
+
+		rel := Relationship(dep)
+
+		g.Edge(coord, depCoord, rel)
+	}
+}
+
+var seen map[string]struct{} = make(map[string]struct{})
+
+type SeenSet struct {
+	seen map[string]struct{}
+	sync.Mutex
+}
+
+func (ss *SeenSet) Add(v string) {
+	ss.seen[v] = struct{}{}
+}
+
+func (ss *SeenSet) Contains(v string) bool {
+	_, ok := ss.seen[v]
+
+	return ok
+}
+
+var walked *SeenSet = &SeenSet{seen: make(map[string]struct{})}
+
+func walkPoms(coord string, r *Repository, g *graph.Digraph, ch chan string) {
+	walked.Lock()
+	if walked.Contains(coord) {
 		return
 	}
+
+	walked.Add(coord)
+	walked.Unlock()
 
 	pom, err := r.RetrievePom(coord)
 	if err != nil {
-		fmt.Printf("%v - %v\n", coord, err)
+		log.Println(err)
 		return
 	}
 
-	seen[coord] = pom
+	processProperties(coord, g, pom)
 
-	if pom.Parent != nil {
-		FollowGraph(r, pom.Parent.Coord(), seen)
-	}
+	processParent(coord, g, pom, ch)
 
-	merged, err := pom.MergeProperties(seen)
-	if err != nil {
-		fmt.Printf("%v - %v\n", coord, err)
-		return
-	}
+	processManagedDependencies(coord, g, pom)
 
-	seen[coord] = merged
+	processDependencies(coord, g, pom)
 
-	for _, d := range merged.Dependencies {
-		if d.Scope != "" {
-			continue
-		}
+	graph.Print(g)
 
-		if d.Version == "" {
-			fmt.Println("SKIP - " + d.Coord())
-			continue
-		}
-
-		FollowGraph(r, d.Coord(), seen)
+	for _, depNode := range g.Children(coord, graph.HasRelationship("compile")) {
+		ch <- depNode.Name()
 	}
 }
